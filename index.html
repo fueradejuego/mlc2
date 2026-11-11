@@ -2810,7 +2810,453 @@ DE JUEGO</font></h3>
 
         </div>
     </div>
+<script>
+(function(){
+  'use strict';
+  const STREAMS  = [{"type":"iframe","iframe":"https://bp.zicotv.cc/api/player/54844","primary":"[DAZN 🇪🇸] The Run Home with Scope and Fletch","network":"bp.zicotv.cc","hd":true,"lang":"es","source":"bp.zicotv.cc"},{"type":"iframe","iframe":"https://bp.zicotv.cc/api/player/54916","primary":"[DAZN 🇮🇹] The Run Home with Scope and Fletch","network":"bp.zicotv.cc","hd":true,"lang":"es","source":"bp.zicotv.cc"}];
+  const EVENT_URL = "zicotv:114686";
+  const TIMEOUT_MS = 8000;
+  const HIDE_DELAY = 3000;
 
+  const $ = id => document.getElementById(id);
+  const player = $('vcPlayer');
+  const iframe = $('vcIframe');
+  const video  = $('vcVideo');
+  let hls = null;          // instancia HLS.js cuando hay fuente type=hls activa
+  let hlsRetryTimer = null;
+  const loading = $('vcLoading');
+  const loadingText = $('vcLoadingText');
+  const controls = $('vcControls');
+  const picker = $('vcPicker');
+  const status = $('vcStatus');
+  const statusSrc = $('vcStatusSource');
+  const setStatus = (txt) => { if (status) status.textContent = txt; };
+  const setStatusSrc = (txt) => { if (statusSrc) statusSrc.textContent = txt; };
+
+  let currentIdx = 0;
+  let onloadFired = false;
+  let timeoutId = null;
+  let hideTimeoutId = null;
+  let attempted = new Set();
+  const broken = new Set();
+  let currentSize = null;
+
+  function setState(s) {
+    player.dataset.state = s;
+    // Sincronizar banner "activar audio" cada vez que cambia el estado.
+    // syncMuteUI puede no existir aún en la primera llamada — guard.
+    if (typeof syncMuteUI === 'function') syncMuteUI();
+  }
+
+  // Detecta dimensiones intrínsecas desde params URL (w, h, width, height)
+  function detectSize(url) {
+    try {
+      const u = new URL(url);
+      const w = parseInt(u.searchParams.get('w'))     || parseInt(u.searchParams.get('width'));
+      const h = parseInt(u.searchParams.get('h'))     || parseInt(u.searchParams.get('height'));
+      if (w > 100 && h > 100) return { w, h };
+    } catch (e) {}
+    return null;
+  }
+
+  // Si la URL tiene params de tamaño, los boostea pidiendo render más grande
+  function rewriteUrl(url) {
+    try {
+      const u = new URL(url);
+      let touched = false;
+      ['w','width'].forEach(k => { if (u.searchParams.has(k)) { u.searchParams.set(k, '1920'); touched = true; } });
+      ['h','height'].forEach(k => { if (u.searchParams.has(k)) { u.searchParams.set(k, '1080'); touched = true; } });
+      return touched ? u.toString() : url;
+    } catch (e) { return url; }
+  }
+
+  // Escala el iframe para llenar el contenedor cuando el contenido tiene
+  // dimensiones intrínsecas distintas (cover-fit, sin distorsión).
+  function applyFit() {
+    const props = ['position','left','top','width','height','transform','transformOrigin','margin'];
+    props.forEach(p => iframe.style[p] = '');
+    if (!currentSize) return;
+    const stage = document.getElementById('vcStage');
+    const cw = stage.clientWidth, ch = stage.clientHeight;
+    if (cw < 50 || ch < 50) return;
+    const { w, h } = currentSize;
+    const scale = Math.max(cw / w, ch / h);
+    iframe.style.position = 'absolute';
+    iframe.style.left = '50%';
+    iframe.style.top = '50%';
+    iframe.style.width = w + 'px';
+    iframe.style.height = h + 'px';
+    iframe.style.transformOrigin = 'center center';
+    iframe.style.transform = `translate(-50%, -50%) scale(${scale})`;
+  }
+
+  function updateChip(s) {
+    if (!s) return;
+    $('vcSourceNum').textContent = String(currentIdx + 1).padStart(2, '0');
+    $('vcSourcePri').textContent = s.primary;
+    const meta = [];
+    if (s.network) meta.push(s.network);
+    if (s.lang) meta.push(s.lang.length > 16 ? s.lang.slice(0,16) + '…' : s.lang);
+    if (s.hd) meta.push('HD');
+    $('vcSourceSec').textContent = meta.join(' · ') || '—';
+    setStatusSrc(s.primary + (s.network ? ' · ' + s.network : ''));
+  }
+
+  function renderTiles() {
+    document.querySelectorAll('.vc-tile').forEach((el, idx) => {
+      el.classList.toggle('is-active', idx === currentIdx);
+      el.classList.toggle('is-broken', broken.has(idx));
+    });
+  }
+
+  function destroyHls() {
+    if (hlsRetryTimer) { clearTimeout(hlsRetryTimer); hlsRetryTimer = null; }
+    if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+    try { video.pause(); } catch (e) {}
+    video.removeAttribute('src');
+    try { video.load(); } catch (e) {}
+  }
+
+  function clearIframe() {
+    try { iframe.src = 'about:blank'; } catch (e) {}
+  }
+
+  function loadIframe(i, s) {
+    destroyHls();
+    video.hidden = true;
+    iframe.hidden = false;
+    onloadFired = false;
+    const rewritten = rewriteUrl(s.iframe);
+    currentSize = detectSize(rewritten) || detectSize(s.iframe);
+    ['position','left','top','width','height','transform','transformOrigin','margin'].forEach(p => iframe.style[p] = '');
+    iframe.src = 'about:blank';
+    setTimeout(() => { iframe.src = rewritten; }, 30);
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      if (!onloadFired) {
+        markBroken(i, 'timeout');
+        autoNext();
+      }
+    }, TIMEOUT_MS);
+  }
+
+  async function loadHlsSource(i, s) {
+    clearIframe();
+    iframe.hidden = true;
+    destroyHls();
+    currentSize = null;
+    video.hidden = false;
+    onloadFired = false;
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      if (!onloadFired) {
+        markBroken(i, 'timeout');
+        autoNext();
+      }
+    }, TIMEOUT_MS * 2);  // HLS handshake suele tardar algo más
+    let signedUrl = null;
+    try {
+      const r = await fetch('/live-resolve.php?slug=' + encodeURIComponent(s.slug), { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('resolver ' + r.status);
+      const j = await r.json();
+      if (!j || !j.url) throw new Error('no url');
+      signedUrl = j.url;
+    } catch (e) {
+      if (currentIdx !== i) return;  // el usuario ya cambió de fuente
+      markBroken(i, 'resolve-error');
+      autoNext();
+      return;
+    }
+    if (currentIdx !== i) return;
+    const onCanPlay = () => {
+      if (currentIdx !== i) return;
+      onloadFired = true;
+      clearTimeout(timeoutId);
+      loading.hidden = true;
+      setState('playing');
+      setStatus('reproduciendo');
+      showControls();
+      video.play().catch(() => {});
+    };
+    if (window.Hls && window.Hls.isSupported()) {
+      hls = new window.Hls({
+        enableWorker: true,
+        liveSyncDurationCount: 4,
+        backBufferLength: 30,
+      });
+      hls.loadSource(signedUrl);
+      hls.attachMedia(video);
+      hls.on(window.Hls.Events.MANIFEST_PARSED, onCanPlay);
+      hls.on(window.Hls.Events.ERROR, (_e, data) => {
+        if (!data) return;
+        if (data.fatal) {
+          console.warn('[hls fatal]', data.type, data.details);
+          if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR && hls && hls.startLoad) {
+            try { hls.startLoad(); return; } catch (e) {}
+          }
+          if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && hls && hls.recoverMediaError) {
+            try { hls.recoverMediaError(); return; } catch (e) {}
+          }
+          if (currentIdx !== i) return;
+          markBroken(i, 'hls-' + (data.type || 'fatal'));
+          autoNext();
+        } else {
+          console.debug('[hls non-fatal]', data.type, data.details);
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari
+      video.src = signedUrl;
+      video.addEventListener('loadedmetadata', onCanPlay, { once: true });
+      video.addEventListener('error', () => {
+        if (currentIdx !== i) return;
+        markBroken(i, 'native-hls-error');
+        autoNext();
+      }, { once: true });
+    } else {
+      markBroken(i, 'hls-unsupported');
+      autoNext();
+    }
+  }
+
+  function load(i) {
+    if (i < 0 || i >= STREAMS.length) return;
+    currentIdx = i;
+    attempted.add(i);
+    const s = STREAMS[i];
+    if (!s) return;
+    const u = new URL(location.href);
+    u.searchParams.set('s', i);
+    history.replaceState(null, '', u);
+    updateChip(s);
+    renderTiles();
+    setStatus('cargando');
+    setState('loading');
+    loading.hidden = false;
+    $('vcFailed').hidden = true;
+    loadingText.textContent = 'Conectando con ' + s.primary + (s.network ? ' · ' + s.network : '');
+    if (s.type === 'hls') {
+      loadHlsSource(i, s);
+    } else {
+      loadIframe(i, s);
+    }
+  }
+
+  function autoNext() {
+    for (let n = currentIdx + 1; n < STREAMS.length; n++) if (!attempted.has(n)) return load(n);
+    for (let n = 0; n < currentIdx; n++) if (!attempted.has(n)) return load(n);
+    showAllFailed();
+  }
+
+  function showAllFailed() {
+    clearTimeout(timeoutId);
+    loading.hidden = true;
+    $('vcFailed').hidden = false;
+    setState('failed');
+    setStatus('todas fallaron');
+  }
+
+  function markBroken(i, reason) {
+    broken.add(i);
+    renderTiles();
+    reportBroken(STREAMS[i], reason);
+  }
+
+  async function reportBroken(s, reason) {
+    try {
+      await fetch('/api/report-broken', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({event_url: EVENT_URL, source_url: s.iframe, source_name: s.source || s.network || '', reason}),
+      });
+    } catch (e) {}
+  }
+
+  function stop() {
+    clearIframe();
+    iframe.hidden = true;
+    destroyHls();
+    video.hidden = true;
+    if (typeof endPassthrough === 'function') endPassthrough();
+    setState('prelude');
+    setStatus('pausado');
+    clearTimeout(timeoutId);
+    onloadFired = false;
+  }
+
+  function play() { load(currentIdx); }
+
+  iframe.addEventListener('load', () => {
+    if (!iframe.src || iframe.src === 'about:blank' || iframe.src.endsWith('about:blank')) return;
+    // Si la fuente activa es HLS, ignorar el load del iframe (puede dispararse al limpiarlo)
+    const cur = STREAMS[currentIdx];
+    if (cur && cur.type === 'hls') return;
+    onloadFired = true;
+    clearTimeout(timeoutId);
+    loading.hidden = true;
+    setState('playing');
+    setStatus('reproduciendo');
+    showControls();
+    applyFit();
+  });
+
+  $('vcStart').addEventListener('click', () => load(currentIdx));
+
+  $('vcToggle').addEventListener('click', () => {
+    const s = player.dataset.state;
+    if (s === 'playing' || s === 'loading') stop();
+    else play();
+  });
+
+  $('vcSourceChip').addEventListener('click', () => openPicker());
+  $('vcPickerClose').addEventListener('click', () => closePicker());
+  picker.addEventListener('click', e => { if (e.target === picker) closePicker(); });
+  function openPicker() { picker.hidden = false; requestAnimationFrame(() => picker.classList.add('is-open')); }
+  function closePicker() {
+    picker.classList.remove('is-open');
+    setTimeout(() => { picker.hidden = true; }, 350);
+  }
+
+  document.querySelectorAll('.vc-tile').forEach((el, idx) => {
+    el.addEventListener('click', () => { load(idx); closePicker(); });
+  });
+
+  $('vcReport').addEventListener('click', () => { markBroken(currentIdx, 'manual'); autoNext(); });
+
+  $('vcRetryAll').addEventListener('click', () => {
+    attempted.clear();
+    broken.clear();
+    $('vcFailed').hidden = true;
+    load(0);
+  });
+
+  // ── Audio / mute ────────────────────────────────────────────────────────
+  const muteBtn  = $('vcMute');
+  const unmuteBn = $('vcUnmute');
+  const toast    = $('vcToast');
+  let toastTimer = null;
+
+  function showToast(html, ms) {
+    toast.innerHTML = html;
+    toast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.hidden = true; }, ms || 5000);
+  }
+
+  function syncMuteUI() {
+    // El estado real del audio depende del tipo de fuente:
+    // - HLS: leemos video.muted
+    // - iframe: no podemos saberlo; asumimos que arranca silenciado
+    const cur = STREAMS[currentIdx];
+    const isHls = cur && cur.type === 'hls';
+    const muted = isHls ? video.muted : true;   // iframe: siempre tratamos como "muted" hasta que el usuario toque dentro
+    muteBtn.classList.toggle('is-muted', muted);
+    muteBtn.setAttribute('title', muted ? 'Activar audio' : 'Silenciar');
+    // Banner grande solo si está muted Y el player está reproduciendo
+    const playing = player.dataset.state === 'playing';
+    unmuteBn.hidden = !(muted && playing);
+  }
+
+  // Passthrough mode: ocultar overlay para que clicks lleguen al iframe
+  const countdownEl   = $('vcCountdown');
+  const countdownSecs = $('vcCountdownSecs');
+  const PASSTHROUGH_SECS = 6;
+  let passthroughTimer = null;
+  let passthroughIntv  = null;
+
+  function endPassthrough() {
+    player.classList.remove('is-audio-passthrough');
+    countdownEl.hidden = true;
+    clearTimeout(passthroughTimer);
+    clearInterval(passthroughIntv);
+    passthroughTimer = null;
+    passthroughIntv  = null;
+  }
+
+  function startPassthrough() {
+    player.classList.add('is-audio-passthrough');
+    countdownEl.hidden = false;
+    let remaining = PASSTHROUGH_SECS;
+    countdownSecs.textContent = remaining;
+    clearInterval(passthroughIntv);
+    passthroughIntv = setInterval(() => {
+      remaining--;
+      if (remaining <= 0) { endPassthrough(); return; }
+      countdownSecs.textContent = remaining;
+    }, 1000);
+    clearTimeout(passthroughTimer);
+    passthroughTimer = setTimeout(endPassthrough, PASSTHROUGH_SECS * 1000);
+  }
+
+  function handleAudioToggle() {
+    const cur = STREAMS[currentIdx];
+    if (!cur) return;
+    if (cur.type === 'hls') {
+      // Toggle directo sobre el <video>
+      video.muted = !video.muted;
+      if (!video.muted) { try { video.volume = 1; video.play().catch(()=>{}); } catch(e){} }
+      syncMuteUI();
+    } else {
+      // Iframe cross-origin: no podemos tocar su audio desde fuera. Escondemos
+      // nuestra capa de controles 6s para que el usuario pueda clickar dentro
+      // del reproductor scrapeado y activar su propio audio.
+      startPassthrough();
+    }
+  }
+
+  muteBtn.addEventListener('click', handleAudioToggle);
+  unmuteBn.addEventListener('click', handleAudioToggle);
+
+  // Actualizar UI cuando cambia el estado real del <video>
+  video.addEventListener('volumechange', syncMuteUI);
+  // Inicial: muted
+  video.muted = true;
+  syncMuteUI();
+
+  $('vcFullscreen').addEventListener('click', () => {
+    if (!document.fullscreenElement) player.requestFullscreen?.();
+    else document.exitFullscreen?.();
+  });
+  document.addEventListener('fullscreenchange', () => {
+    player.classList.toggle('is-fullscreen', !!document.fullscreenElement);
+    setTimeout(applyFit, 60);
+  });
+
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(applyFit, 120);
+  });
+
+  function showControls() {
+    if (player.dataset.state !== 'playing') return;
+    controls.classList.remove('is-hidden');
+    clearTimeout(hideTimeoutId);
+    hideTimeoutId = setTimeout(() => {
+      if (!picker.classList.contains('is-open')) controls.classList.add('is-hidden');
+    }, HIDE_DELAY);
+  }
+  player.addEventListener('mousemove', showControls);
+  player.addEventListener('mouseleave', () => {
+    if (player.dataset.state === 'playing' && !picker.classList.contains('is-open'))
+      controls.classList.add('is-hidden');
+  });
+  player.addEventListener('touchstart', () => { if (player.dataset.state === 'playing') showControls(); }, {passive: true});
+
+  document.addEventListener('keydown', e => {
+    if (e.target.matches('input, textarea, [contenteditable]')) return;
+    if (e.key === ' ' || e.key === 'k' || e.key === 'K') { e.preventDefault(); $('vcToggle').click(); }
+    if (e.key === 'f' || e.key === 'F') $('vcFullscreen').click();
+    if (e.key === 'Escape') closePicker();
+    if (e.key === 'ArrowRight' && e.shiftKey) { e.preventDefault(); load((currentIdx + 1) % STREAMS.length); }
+    if (e.key === 'ArrowLeft'  && e.shiftKey) { e.preventDefault(); load(currentIdx > 0 ? currentIdx - 1 : STREAMS.length - 1); }
+  });
+
+  if (STREAMS[currentIdx]) updateChip(STREAMS[currentIdx]);
+  renderTiles();
+  setState('prelude');
+})();
+</script>
     <script>
         // ==========================================
         // CONFIGURACIÓN DEL GENERADOR M3U (AlwaysData)
